@@ -14,6 +14,11 @@ pub enum AST {
     If(Box<AST>, Box<AST>, Box<AST>),
     /// Let varname = expression in body
     Let(String, Box<AST>, Box<AST>),
+    /// Function of one argument
+    Lambda(String, Box<AST>),
+    /// Apply a function to an argument
+    /// The first argument is the lambda, the second is the argument
+    Apply(Box<AST>, Box<AST>),
 }
 
 /// Convenience constructor for AST::ILit
@@ -46,8 +51,19 @@ pub fn let_in(name: &str, bind: AST, body: AST) -> AST {
     AST::Let(name.to_string(), Box::new(bind), Box::new(body))
 }
 
+/// Convenience constructor for AST::Var
 pub fn var(name: &str) -> AST {
     AST::Var(name.to_string())
+}
+
+/// Convenience constructor for AST::Lambda
+pub fn lambda(name: &str, body: AST) -> AST {
+    AST::Lambda(name.to_string(), Box::new(body))
+}
+
+/// Convenience constructor for AST::Apply
+pub fn apply(l: AST, arg: AST) -> AST {
+    AST::Apply(Box::new(l), Box::new(arg))
 }
 
 /// The opcodes that will be emitted by the compiler and interpreted by the vm to execute the
@@ -67,10 +83,24 @@ pub enum Opcode {
     DropLocal,
     /// Look up a local variable from the environment
     LookupLocal(String),
+    /// Creates a `Function` and pushes it onto the stack
+    /// It contains the name of the local variable to bind
+    MakeFn,
+    /// Pushes the value onto the stack and then jumps back to the given address
+    Return,
+    /// Calls a function, pushing the current location onto the stack for return to pop and jump to
+    Call,
     /// Primitive Add. Will add opcodes for primitive operations for now, and will remove and
     /// replace with functions if/when I get around to defining functions
     Add,
     Gt,
+}
+
+/// Represents a function
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub struct Function {
+    /// The index of the first instruction in the function
+    enter: usize,
 }
 
 /// Terms that will be processed in the vm and eventually returrned
@@ -78,10 +108,16 @@ pub enum Opcode {
 pub enum Term {
     Int(i64),
     Bool(bool),
+    Func(Function),
+    /// Should never be obeservable to a user, but allows function calls to push the return value
+    /// onto the stack
+    Return(usize),
 }
 
-/// Wraps a vec that is used for the program stack and a mapping of local variable names to their
-/// positions on the stack
+/// Represents all of the state the bytecode virtual machine needs to hold.
+/// 1. The program stack
+/// 2. Local variable mappings
+/// 3. Function mappings
 #[derive(Debug, Eq, PartialEq)]
 pub struct Stack {
     stack: Vec<Term>,
@@ -118,7 +154,7 @@ impl Stack {
         self.locals.push((v, sp));
     }
 
-    /// DropLocal is called directly after the body expression in a let-in, so the stack looks like
+    /// DropLocal is called directly after the body expression in a let-in, when the stack looks like
     /// `[..., localvar, bodyresult]`
     fn drop_local(&mut self) {
         self.locals
@@ -192,6 +228,29 @@ pub fn compile(ast: AST) -> Vec<Opcode> {
             bind.push(Opcode::DropLocal);
             bind
         }
+        AST::Lambda(v, x) => {
+            let mut body = compile(*x);
+            // Jump past the body of the function during execution
+            // the function body will only be executed when `Call` jumps into it
+            // plus one extra for the BindLocal, DropLocal, and Return instructions
+            let jmp = body.len() + 4;
+            let mut f = vec![
+                Opcode::MakeFn,
+                Opcode::Jump(jmp),
+                Opcode::BindLocal(v.clone()),
+            ];
+            f.append(&mut body);
+            f.push(Opcode::DropLocal);
+            f.push(Opcode::Return);
+            f
+        }
+        AST::Apply(x, y) => {
+            let mut func = compile(*x);
+            let mut arg = compile(*y);
+            arg.append(&mut func);
+            arg.push(Opcode::Call);
+            arg
+        }
     }
 }
 
@@ -253,6 +312,39 @@ pub fn run(program: Vec<Opcode>, stack: &mut Stack) -> Term {
                 stack.push(l);
                 pc += 1;
             }
+            Opcode::MakeFn => {
+                // The address of the first instruction in the function body
+                // The next instruction is a `Jump` over the body, so the beginning of the body is
+                // two instructions away
+                let enter = pc + 2;
+                let f = Function { enter };
+                stack.push(Term::Func(f));
+                // This will jump across the function body
+                pc += 1;
+            }
+            Opcode::Call => {
+                // First pop the function
+                let f = assert_fn(stack.pop());
+                // Then the argument
+                let x = stack.pop();
+                // Then push the return pointer
+                stack.push(Term::Return(pc + 1));
+                // Then push the argument to be bound as a local variable
+                stack.push(x);
+                // Set the current program counter to the entry of the function body
+                pc = f.enter;
+            }
+            Opcode::Return => {
+                // the result will be the topmost value of the stack
+                let result = stack.pop();
+                // the return pointer is the next value on the stack
+                let ret_ptr = assert_return(stack.pop());
+                // push the result back onto the stack so the caller has access to it
+                stack.push(result);
+                // set the program counter to the return pointer to continue from where the
+                // function was called
+                pc = ret_ptr;
+            }
         }
     }
     stack.pop()
@@ -262,15 +354,31 @@ pub fn run(program: Vec<Opcode>, stack: &mut Stack) -> Term {
 fn assert_int(t: Term) -> i64 {
     match t {
         Term::Int(i) => i,
-        Term::Bool(_) => panic!("Type Error: Expected Int, but got Bool"),
+        t => panic!("Type Error: Expected Int, but got {:?}", t),
     }
 }
 
 /// Throw a runtime type error if the term's type is not what is expected
 fn assert_bool(t: Term) -> bool {
     match t {
-        Term::Int(_) => panic!("Type Error: Expected Bool, but got Int"),
         Term::Bool(b) => b,
+        t => panic!("Type Error: Expected Bool, but got {:?}", t),
+    }
+}
+
+/// Throw a runtime type error if the term's type is not what is expected
+fn assert_fn(t: Term) -> Function {
+    match t {
+        Term::Func(f) => f,
+        t => panic!("Type Error: Expected Function, but got {:?}", t),
+    }
+}
+
+/// Throw a runtime type error if the term's type is not what expected
+fn assert_return(t: Term) -> usize {
+    match t {
+        Term::Return(i) => i,
+        t => panic!("Type Error: Expected Return Address, but got {:?}", t),
     }
 }
 
@@ -377,5 +485,27 @@ mod tests {
         let c = compile(program);
         let result = run(c, &mut stack);
         assert_eq!(result, Term::Int(6));
+    }
+
+    #[test]
+    fn immediate_function() {
+        let mut stack = Stack::new();
+        let program = apply(lambda("x", add(var("x"), int_lit(1))), int_lit(2));
+        let c = compile(program);
+        let result = run(c, &mut stack);
+        assert_eq!(result, Term::Int(3));
+    }
+
+    #[test]
+    fn let_bound_function() {
+        let mut stack = Stack::new();
+        let program = let_in(
+            "inc",
+            lambda("x", add(var("x"), int_lit(1))),
+            apply(var("inc"), int_lit(2)),
+        );
+        let c = compile(program);
+        let result = run(c, &mut stack);
+        assert_eq!(result, Term::Int(3));
     }
 }

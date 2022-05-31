@@ -79,3 +79,10 @@ they don't capture variables by lexical scope (they are not closures), and any
 local variables referenced in the body _not_ bound by the arguments, will be
 resolved by the environment at the call-site. This is clearly weird and
 undesirable in general.
+
+## References
+
+Inspired and guided by
+
++ [Max Bernstein](https://bernsteinbear.com/blog/bytecode-interpreters/)
++ [_Crafting Interpreters_](https://craftinginterpreters.com)

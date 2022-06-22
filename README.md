@@ -74,11 +74,13 @@ counter to the function's body, also pushing the return address to the stack.
 The `Return` statement pops the return pointer, pushes the final value of the
 function, and then resets the program counter to the return pointer.
 
-Because functions are simply implemented as pointers to their body beginning,
-they don't capture variables by lexical scope (they are not closures), and any
-local variables referenced in the body _not_ bound by the arguments, will be
-resolved by the environment at the call-site. This is clearly weird and
-undesirable in general.
+Functions close over their environment: the compiler inspects the body of the
+the function and extracts a list of all free variables not bound by that
+function (or any sub-terms). At runtime, when the function is created (via `MakeFunction`),
+the values of those variables are copied off of the stack into the `Function`
+struct, and when the function is called those variables are pushed onto the
+stack and bound. Once the function returns, they are popped back off the stack
+and dropped.
 
 ## References
 

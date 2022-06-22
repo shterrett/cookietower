@@ -84,10 +84,11 @@ pub enum Opcode {
     /// Look up a local variable from the environment
     LookupLocal(String),
     /// Creates a `Function` and pushes it onto the stack
-    /// It contains the name of the local variable to bind
-    MakeFn,
+    /// It contains the names of the variables closed over from the environment
+    MakeFn(Vec<String>),
     /// Pushes the value onto the stack and then jumps back to the given address
-    Return,
+    /// Also contains the number of free variables closed over so they can be unbound
+    Return(usize),
     /// Calls a function, pushing the current location onto the stack for return to pop and jump to
     Call,
     /// Primitive Add. Will add opcodes for primitive operations for now, and will remove and
@@ -101,6 +102,7 @@ pub enum Opcode {
 pub struct Function {
     /// The index of the first instruction in the function
     enter: usize,
+    locals: Vec<(String, Term)>,
 }
 
 /// Terms that will be processed in the vm and eventually returrned
@@ -165,6 +167,15 @@ impl Stack {
         self.push(result);
     }
 
+    /// drops all of the locals closed over by a lambda that were pushed onto the stack
+    /// contiguously when the lambda is called
+    fn drop_locals(&mut self, count: usize) {
+        (0..count).for_each(|_| {
+            self.locals.pop();
+            self.pop();
+        });
+    }
+
     fn lookup(&self, name: &str) -> Term {
         let (_, pos) = self
             .locals
@@ -172,6 +183,21 @@ impl Stack {
             .rfind(|(binding, _)| binding == name)
             .expect(&format!("Error -- unbound variable {}", name));
         self.stack[*pos].clone()
+    }
+
+    /// Copies the first occurrence of each of the given local variables from the stack to be
+    /// stored with the function to enable closures.
+    /// If any of the referenced variables don't exist on the stack, don't error here (why? should
+    /// I? Think more about this)
+    fn clone_locals(&self, vars: &[String]) -> Vec<(String, Term)> {
+        vars.iter()
+            .filter_map(|v| {
+                self.locals
+                    .iter()
+                    .rfind(|(binding, _)| binding == v)
+                    .map(|(_, pos)| (v.clone(), self.stack[*pos].clone()))
+            })
+            .collect::<Vec<(String, Term)>>()
     }
 }
 
@@ -229,19 +255,26 @@ pub fn compile(ast: AST) -> Vec<Opcode> {
             bind
         }
         AST::Lambda(v, x) => {
+            // Grab the names of all the free variables in the body of the lambda expression.
+            // They get bundled into the opcode so that when the function is defined (at runtime),
+            // the values of those local variables are captured in the function
+            let mut bounds = vec![&*v];
+            let fv = free_variables(&mut bounds, &x);
+            let fv_count = fv.len();
+
             let mut body = compile(*x);
             // Jump past the body of the function during execution
             // the function body will only be executed when `Call` jumps into it
             // plus one extra for the BindLocal, DropLocal, and Return instructions
             let jmp = body.len() + 4;
             let mut f = vec![
-                Opcode::MakeFn,
+                Opcode::MakeFn(fv),
                 Opcode::Jump(jmp),
                 Opcode::BindLocal(v.clone()),
             ];
             f.append(&mut body);
             f.push(Opcode::DropLocal);
-            f.push(Opcode::Return);
+            f.push(Opcode::Return(fv_count));
             f
         }
         AST::Apply(x, y) => {
@@ -250,6 +283,60 @@ pub fn compile(ast: AST) -> Vec<Opcode> {
             arg.append(&mut func);
             arg.push(Opcode::Call);
             arg
+        }
+    }
+}
+
+fn free_variables<'a>(param: &mut Vec<&'a str>, body: &'a AST) -> Vec<String> {
+    match body {
+        AST::ILit(_) => vec![],
+        AST::BLit(_) => vec![],
+        AST::Var(x) => {
+            if param.iter().any(|e| e == x) {
+                vec![]
+            } else {
+                vec![x.clone()]
+            }
+        }
+        AST::Add(x, y) => {
+            let mut fx = free_variables(param, x);
+            let mut fy = free_variables(param, y);
+            fx.append(&mut fy);
+            fx
+        }
+        AST::Gt(x, y) => {
+            let mut fx = free_variables(param, x);
+            let mut fy = free_variables(param, y);
+            fx.append(&mut fy);
+            fx
+        }
+        AST::If(x, y, z) => {
+            let mut fx = free_variables(param, x);
+            let mut fy = free_variables(param, y);
+            let mut fz = free_variables(param, z);
+            fx.append(&mut fy);
+            fx.append(&mut fz);
+            fx
+        }
+        AST::Let(var, x, y) => {
+            param.push(&var);
+            let mut fx = free_variables(param, x);
+            let mut fy = free_variables(param, y);
+            fx.append(&mut fy);
+            param.pop();
+            fx
+        }
+        AST::Lambda(var, x) => {
+            param.push(&var);
+            let fx = free_variables(param, x);
+            param.pop();
+            fx
+        }
+        AST::Apply(x, y) => {
+            let mut fx = free_variables(param, x);
+            let mut fy = free_variables(param, y);
+            fx.append(&mut fy);
+            fx
         }
     }
 }
@@ -312,12 +399,13 @@ pub fn run(program: Vec<Opcode>, stack: &mut Stack) -> Term {
                 stack.push(l);
                 pc += 1;
             }
-            Opcode::MakeFn => {
+            Opcode::MakeFn(fv) => {
                 // The address of the first instruction in the function body
                 // The next instruction is a `Jump` over the body, so the beginning of the body is
                 // two instructions away
+                let locals = stack.clone_locals(&fv);
                 let enter = pc + 2;
-                let f = Function { enter };
+                let f = Function { enter, locals };
                 stack.push(Term::Func(f));
                 // This will jump across the function body
                 pc += 1;
@@ -327,6 +415,11 @@ pub fn run(program: Vec<Opcode>, stack: &mut Stack) -> Term {
                 let f = assert_fn(stack.pop());
                 // Then the argument
                 let x = stack.pop();
+                // Then push the closed-over free variables
+                f.locals.into_iter().for_each(|(var, val)| {
+                    stack.push(val);
+                    stack.bind_local(var);
+                });
                 // Then push the return pointer
                 stack.push(Term::Return(pc + 1));
                 // Then push the argument to be bound as a local variable
@@ -334,11 +427,13 @@ pub fn run(program: Vec<Opcode>, stack: &mut Stack) -> Term {
                 // Set the current program counter to the entry of the function body
                 pc = f.enter;
             }
-            Opcode::Return => {
+            Opcode::Return(fv) => {
                 // the result will be the topmost value of the stack
                 let result = stack.pop();
                 // the return pointer is the next value on the stack
                 let ret_ptr = assert_return(stack.pop());
+                // Pop and unbind the free variables that were closed over
+                stack.drop_locals(*fv);
                 // push the result back onto the stack so the caller has access to it
                 stack.push(result);
                 // set the program counter to the return pointer to continue from where the
@@ -507,5 +602,64 @@ mod tests {
         let c = compile(program);
         let result = run(c, &mut stack);
         assert_eq!(result, Term::Int(3));
+    }
+
+    #[test]
+    fn free_variables_expr() {
+        let ast = add(var("x"), var("y"));
+        let mut bound = vec![];
+        let fv1 = free_variables(&mut bound, &ast);
+        bound.push("x");
+        let fv2 = free_variables(&mut bound, &ast);
+        bound.push("y");
+        let fv3 = free_variables(&mut bound, &ast);
+        assert_eq!(fv1, vec!["x", "y"]);
+        assert_eq!(fv2, vec!["y"]);
+        let empty: Vec<String> = vec![];
+        assert_eq!(fv3, empty);
+    }
+
+    #[test]
+    fn free_variables_under_let() {
+        let ast = let_in("x", int_lit(3), add(var("x"), var("y")));
+        let mut bound = vec![];
+        let fv = free_variables(&mut bound, &ast);
+        assert_eq!(fv, vec!["y"]);
+    }
+
+    #[test]
+    fn free_variables_under_lambda() {
+        let ast = lambda("x", add(var("x"), var("y")));
+        let mut bound = vec![];
+        let fv = free_variables(&mut bound, &ast);
+        assert_eq!(fv, vec!["y"]);
+    }
+
+    #[test]
+    fn test_basic_closure() {
+        let mut stack = Stack::new();
+        let ast = apply(
+            let_in("x", int_lit(3), lambda("y", add(var("x"), var("y")))),
+            int_lit(5),
+        );
+        let c = compile(ast);
+        let result = run(c, &mut stack);
+        assert_eq!(result, Term::Int(8));
+    }
+
+    #[test]
+    fn test_closure_with_shadowing() {
+        let mut stack = Stack::new();
+        let ast = let_in(
+            "x",
+            int_lit(4),
+            apply(
+                let_in("x", int_lit(3), lambda("y", add(var("x"), var("y")))),
+                int_lit(5),
+            ),
+        );
+        let c = compile(ast);
+        let result = run(c, &mut stack);
+        assert_eq!(result, Term::Int(8));
     }
 }
